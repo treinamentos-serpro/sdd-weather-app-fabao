@@ -60,22 +60,51 @@ proposta para a implementação, não um inventário de arquivos existentes:
 
 ```text
 src/
-  components/       busca, seleção, clima atual, previsão e estados da UI
-  services/         chamadas Open-Meteo, validação e normalização
-  types/            modelos de domínio e estados de operação
-  utils/            conversão e formatação, se forem funções reutilizáveis
-  App.tsx           composição dos fluxos e estado da página
+  components/       apresentação da busca, resultados, clima e estados da UI
+  hooks/            estado local e orquestração dos fluxos da tela
+  services/         transporte HTTP e adaptação das respostas Open-Meteo
+  lib/              regras puras, normalização, conversão e formatação
+  types/            contratos de domínio e estados de operação
+  App.tsx           composição da página e conexão entre hook e componentes
   main.tsx          inicialização da aplicação
 tests/
-  unit/             testes de serviços, normalização e conversão
+  unit/             testes de lib, services e hooks
   components/       testes de comportamento e acessibilidade
-e2e/
-  weather.spec.ts   fluxos principais no navegador
+  e2e/
+    weather.spec.ts fluxos principais no navegador
 ```
 
-Manter `components` independente do formato da API e `services` independente
-da renderização. Criar hooks ou utilitários separados somente quando houver
-lógica reutilizável, sem introduzir camadas adicionais por antecipação.
+### Responsabilidades e dependências
+
+- **`components/`:** renderiza dados recebidos por props, comunica ações por
+  callbacks e apresenta estados de carregamento, vazio, erro e dados parciais.
+  Manter um componente por arquivo. Não chama `fetch`, não conhece os DTOs da
+  API nem coordena concorrência.
+- **`hooks/`:** coordena o estado React local e os fluxos da tela, incluindo
+  busca, seleção explícita de cidade, consulta meteorológica, unidade e retry.
+  Descarta respostas obsoletas e delega transporte e normalização às camadas
+  correspondentes.
+- **`services/`:** encapsula chamadas HTTP, URLs, timeout, cancelamento e erros
+  de rede, HTTP ou JSON. Adapta as respostas externas aos tipos de domínio e
+  não importa componentes ou hooks.
+- **`lib/`:** contém funções sem efeitos colaterais, como normalização,
+  mapeamento de códigos WMO, conversão de temperatura e formatação. Não acessa
+  React, rede ou estado global.
+- **`types/`:** define contratos compartilhados pelas camadas, sem depender
+  delas. A interface consome modelos normalizados em vez de formatos brutos da
+  API.
+
+A direção das dependências é `components → hooks → services → Open-Meteo`.
+`components`, `hooks` e `services` podem usar funções de `lib/`; `types/` não
+depende das demais camadas. `App.tsx` compõe a página e `main.tsx` inicializa a
+aplicação. Não adicionar estado global, cache ou persistência sem requisito.
+
+Essa separação define pontos de teste independentes: testar `lib/` diretamente
+com entradas válidas, limites e inválidas; testar `services/` com `fetch`
+simulado para respostas, erros e timeout; testar `hooks/` com serviços
+simulados para transições de estado, retry, unidade e respostas obsoletas; e
+testar `components/` pelo comportamento observável, interação e acessibilidade,
+sem acoplá-los aos detalhes internos das outras camadas.
 
 ## Data Model
 
@@ -93,6 +122,7 @@ type WeatherErrorKind =
   | "timeout"
   | "network"
   | "http"
+  | "api"
   | "invalid-response";
 
 type OperationState<T> =
@@ -108,6 +138,25 @@ ausências sejam convertidas em zero ou estimativas. Uma resposta parcial válid
 preserva os campos válidos e marca cada campo ausente como indisponível (**RF2**,
 **RF3**).
 
+Os estados de operação têm significado distinto: `idle` indica que ainda não
+há operação ativa ou resultado; `loading` identifica a chamada vigente;
+`success` contém dados interpretáveis; `empty` representa uma busca concluída
+sem correspondências; e `error` representa uma falha que impede interpretar a
+operação. Dados meteorológicos parciais continuam em `success`, com cada campo
+ausente marcado como indisponível. Uma resposta meteorológica sem estrutura
+essencial ou sem dados interpretáveis é `error`, não `empty`.
+
+Se nenhum campo de `current` puder ser exibido, mas houver previsão válida e
+estrutura essencial interpretável, manter a operação em `success` parcial.
+Representar os campos atuais como indisponíveis e exibir, nessa seção, a
+mensagem de falha das condições atuais com ação de nova tentativa; preservar
+a previsão válida da mesma cidade. Derivar essa condição dos campos de
+`CurrentWeather`, sem novo estado independente. O retry repete a consulta
+meteorológica completa para a cidade selecionada, usando o mesmo endpoint
+combinado, sem criar requests separados. Se não houver nenhum valor
+meteorológico exibível em toda a resposta, usar `error`; datas isoladas não
+contam como valores meteorológicos (**RF2**, **RF3**, **RF5**).
+
 `City` contém dados devolvidos pela geocodificação; `id` é uma chave interna
 para identificar cada correspondência, não um dado de apresentação. `admin1`
 e `admin2` representam subdivisões retornadas, e `country` e `countryCode`
@@ -117,9 +166,12 @@ de códigos WMO reconhecidos; códigos desconhecidos ficam indisponíveis, sem
 descrição inventada.
 
 Temperaturas ficam normalizadas em Celsius. A unidade escolhida é aplicada na
-apresentação, não armazenada nos dados meteorológicos. `date` é uma data de
-calendário `YYYY-MM-DD` no fuso da cidade; `forecast` contém exatamente cinco
-itens em ordem cronológica, sem repetição (**RF3**, **RF4**).
+renderização, derivada dos valores em Celsius e da unidade atual, não armazenada
+nos dados meteorológicos. A conversão usa a função pura de `lib/` no caminho de
+apresentação; alternar a unidade apenas atualiza o estado local e renderiza os
+valores derivados, sem novo request ou cópia Fahrenheit dos dados. `date` é uma
+data de calendário `YYYY-MM-DD` no fuso da cidade; `forecast` contém exatamente
+cinco itens em ordem cronológica, sem repetição (**RF3**, **RF4**).
 
 Uma resposta é **inválida** se não puder ser interpretada com segurança, se
 contiver erro HTTP/API, ou se faltar informação estrutural necessária para
@@ -241,12 +293,15 @@ indisponíveis; não estimar valores nem reduzir a sequência de cinco dias.
 
 ## State Management
 
-Manter o estado na composição principal ou em um hook local simples, separado
-entre busca e consulta meteorológica:
+Manter o estado React local em um hook de orquestração usado por `App.tsx`;
+`App.tsx` compõe a tela e os componentes recebem valores e ações por props.
+Separar os estados da busca e da consulta meteorológica para que cada fluxo
+tenha seu próprio ciclo explícito:
 
 ```ts
 interface AppState {
   query: string;
+  submittedQuery?: string;
   search: OperationState<City[]>;
   selectedCity?: City;
   weather: OperationState<WeatherData>;
@@ -254,9 +309,16 @@ interface AppState {
 }
 ```
 
-A unidade começa em Celsius e permanece em memória; não persistir entre
-sessões, pois a spec não decide essa persistência. A unidade atual aplica-se
-tanto a resultados exibidos quanto a chamadas em andamento.
+`query` é o texto editável do campo. `submittedQuery` guarda um snapshot do
+termo normalizado da busca vigente e é definido antes de iniciar sua chamada;
+permanece associado ao resultado ou erro até outra busca válida ser aceita.
+Editar o campo não altera esse snapshot. O retry de busca usa `submittedQuery`,
+não `query`, para repetir exatamente a operação que falhou.
+
+A unidade começa em Celsius e permanece no estado local do hook; não persistir
+entre sessões, pois a spec não decide essa persistência. A unidade selecionada
+vale para resultados já exibidos e para respostas de chamadas em andamento. A
+mudança de unidade não altera `weather.data` nem reinicia a operação.
 
 Identificar operações com um contador monotônico e, quando aplicável,
 `AbortController`. Uma nova busca torna obsoleta a anterior; somente o
@@ -265,6 +327,13 @@ associar qualquer resultado meteorológico à cidade contida em `WeatherData`
 e não exibir dados antigos como se fossem dessa seleção. O identificador
 continua necessário mesmo com cancelamento, pois cancelamento não garante que
 uma resposta tardia não chegue.
+
+Ao enviar uma busca por botão ou Enter, comparar o termo após `trim()` com
+`submittedQuery`: se a busca estiver em `loading` para o mesmo termo, não
+iniciar outra chamada nem substituir seu identificador. Um termo normalizado
+diferente inicia uma nova busca e invalida a anterior. Manter a possibilidade
+de enviar outro termo durante loading; bloquear apenas duplicatas, não toda
+a busca. A guarda no hook deve valer independentemente do controle utilizado.
 
 Busca e consulta meteorológica têm estados de carregamento próprios. Não
 armazenar cópias em Fahrenheit, não adicionar cache e impedir retry enquanto a
@@ -282,82 +351,169 @@ mesma operação estiver em andamento (**RF5**).
   `AbortController`. Ao exceder o prazo, encerrar o carregamento, informar
   timeout e oferecer retry. Uma resposta posterior ao deadline não pode
   atualizar o estado, mesmo que o cancelamento de transporte não seja efetivo.
-- **Falha recuperável:** distinguir timeout, rede, HTTP e resposta inválida;
-  apresentar mensagem compreensível em `pt-BR` e permitir repetir a mesma
-  operação, preservando o termo ou a cidade selecionada.
+- **Falha recuperável:** classificar timeout, falha de rede, status HTTP não
+  bem-sucedido, erro explícito retornado no payload pela API e resposta inválida
+  como `timeout`, `network`, `http`, `api` e `invalid-response`,
+  respectivamente. Apresentar mensagem compreensível em `pt-BR` e permitir
+  repetir a mesma operação, preservando o termo ou a cidade selecionada.
 - **Duplicação e concorrência:** desabilitar retry enquanto a operação
-  correspondente estiver ativa. Uma busca nova substitui a anterior; respostas
-  obsoletas são ignoradas. Cada chamada aceita no máximo uma tentativa ativa
-  por operação.
-- **Dados parciais:** mostrar valores válidos e marcar os ausentes como
-  indisponíveis. Não renderizar dados anteriores de outra cidade como
-  resultado da consulta que falhou.
+  correspondente estiver ativa. Reenviar o mesmo termo normalizado pelo botão
+  de busca ou Enter durante loading não gera chamada adicional; um termo
+  diferente substitui a busca anterior. Respostas obsoletas são ignoradas.
+  Cada chamada aceita no máximo uma tentativa ativa por operação.
+- **Resposta parcial:** tratar como sucesso parcial, não como erro: mostrar
+  valores válidos e marcar os ausentes, nulos, não finitos ou não mapeáveis como
+  indisponíveis. Na previsão, preservar os cinco dias e marcar individualmente
+  os campos indisponíveis. Não renderizar dados anteriores de outra cidade como
+  resultado da consulta que falhou. Quando nenhum campo atual for exibível,
+  comunicar falha nessa seção e oferecer retry da consulta completa, sem
+  descartar uma previsão válida da mesma resposta. Esse retry segue o loading
+  e o bloqueio de duplicação da consulta meteorológica normal.
 - **Resposta inválida:** erro de JSON, erro explícito da API, estrutura
   essencial malformada, fuso inválido ou datas impossíveis geram erro
   recuperável, não dados presumidos.
 
 ## Testing Strategy
 
-Usar Vitest para testes unitários e de componentes e Playwright para fluxos
-completos. O scaffold atual ainda não contém `src/` ou `tests/`; os testes
-acompanham a implementação dessas áreas.
+Usar Vitest para regras, serviços, hooks e componentes; reservar Playwright
+para a integração dos fluxos no navegador e comportamento responsivo. O
+scaffold ainda não contém `src/` ou `tests/`: esta é uma estratégia para a
+implementação, não uma declaração de cobertura já existente. Derivar os
+cenários dos critérios de aceite de **RF1–RF5** e **RNF1–RNF6**, **RNF8**.
 
-**Vitest — unitários e componentes**
+### Vitest — funções puras
 
-- Busca: aparar apenas espaços externos, preservar acentos/caracteres e não
-  chamar o serviço para entrada vazia.
-- Geocoding: resultado vazio, localidades homônimas, campos opcionais ausentes
-  e preservação do conteúdo como dado.
-- Forecast: fuso ausente/inválido, datas inválidas ou duplicadas como erro;
-  métricas ausentes como dados parciais; sempre cinco slots, ordenados e sem
-  duplicatas, inclusive quando o fuso da cidade difere do navegador.
-- Unidades: Celsius inicial, conversão nas duas direções, arredondamento a uma
-  casa decimal e ausência de `-0`; mudança de unidade enquanto a consulta está
-  pendente sem nova chamada.
-- Concorrência e recuperação: ignorar resposta obsoleta, timeout em 10
-  segundos, ignorar resposta tardia e bloquear retry duplicado.
-- Componentes: carregamento, vazio, erro e parcial; nomes acessíveis e
-  operação por teclado.
+Testar `lib/` diretamente, sem React ou rede:
 
-Mockar `fetch`, relógio e temporizadores para que os testes não dependam da
-disponibilidade real das APIs.
+- Conversão derivada de Celsius: `0 °C → 32 °F`, `100 °C → 212 °F`,
+  `-40 °C → -40 °F`, temperaturas negativas e fracionárias. Ao voltar a
+  Celsius, usar o valor original, sem acumular erro de conversões sucessivas.
+- Arredondamento a uma casa decimal, formatação em `pt-BR` e ausência de zero
+  negativo. Valores indisponíveis permanecem indisponíveis em ambas as
+  unidades; não converter `null`, `undefined` ou valores não finitos em zero.
+- Normalização da busca com apenas `trim()`, preservando acentos e caracteres.
+- Mapeamento de códigos WMO conhecidos e tratamento de códigos desconhecidos.
+- Normalização de dados parciais, fuso e datas: exatamente cinco dias
+  consecutivos, em ordem e sem duplicatas; incluir virada do dia com o fuso da
+  cidade diferente do navegador. Rejeitar fuso inválido e datas impossíveis;
+  manter o dia quando apenas suas métricas estiverem indisponíveis.
 
-**Playwright — E2E**
+### Vitest — services com mock de `fetch`
 
-- Buscar, selecionar uma localidade e visualizar clima atual e cinco previsões.
-- Exigir escolha explícita entre localidades homônimas.
-- Verificar busca vazia, resultado vazio e detalhes geográficos ausentes.
-- Alternar Celsius/Fahrenheit sem nova consulta e conferir unidade e
-  arredondamento.
-- Simular resposta parcial, falha, timeout e retry, incluindo prevenção de
-  chamadas duplicadas.
-- Entregar resposta obsoleta depois de iniciar outra busca e confirmar que ela
-  não substitui a busca vigente.
-- Validar teclado, nomes acessíveis e layouts estreitos e desktop sem rolagem
-  horizontal que impeça acesso (**RNF1**, **RNF3**, **RNF6**).
+Isolar os serviços com `fetch` simulado, sem chamadas reais à Open-Meteo:
+
+- Verificar endpoints, parâmetros de busca codificados, coordenadas,
+  `temperature_unit=celsius` e os campos de clima atual/previsão solicitados.
+- Converter respostas válidas em modelos de domínio; cobrir geocodificação
+  vazia, cidades homônimas e campos geográficos opcionais ausentes.
+- Distinguir rejeição de rede, status HTTP de erro, erro explícito da API,
+  JSON inválido e estrutura essencial malformada. Verificar os tipos de erro
+  entregues ao hook, sem mascarar falhas como sucesso vazio.
+- Preservar campos válidos em respostas parciais e marcar os demais como
+  indisponíveis; rejeitar fuso/datas inválidos. Cobrir `current` ausente ou sem
+  campos exibíveis com previsão válida como sucesso parcial, e a ausência de
+  qualquer valor meteorológico exibível na resposta inteira como erro.
+- Com temporizadores simulados, verificar que aos 10 segundos a chamada
+  termina em timeout, aborta o transporte e não aceita conclusão tardia.
+  Distinguir cancelamento por substituição de operação de timeout e liberar
+  temporizadores/listeners tanto no sucesso quanto na falha.
+
+### Vitest — hooks e componentes
+
+Testar hooks com serviços simulados; testar componentes com Testing Library
+e `user-event`, usando roles, labels e texto visível, não detalhes internos:
+
+- Hooks: `idle → loading → success`, `loading → empty` na busca e
+  `loading → error`; retry preserva o termo enviado ou a cidade da operação
+  que falhou, mesmo que o texto do campo seja alterado depois.
+- Concorrência: nova busca ou seleção invalida a anterior; respostas antigas
+  não sobrescrevem dados atuais nem associam clima à cidade errada. Retry
+  durante loading não cria chamada duplicada. Reenviar o mesmo termo
+  normalizado por botão ou Enter, inclusive com espaços externos diferentes,
+  mantém uma única chamada e o identificador vigente; enviar outro termo
+  substitui a busca em andamento.
+- Unidade: Celsius inicial; alternar durante e após a consulta atualiza
+  temperatura atual, mínimas e máximas, mantendo os dados em Celsius e a
+  contagem de chamadas ao serviço inalterada.
+- `idle`: campo e orientação inicial disponíveis, sem resultado fictício.
+- `loading`: feedback imediato e acessível por operação; retry indisponível.
+- `error`: mensagem em pt-BR e ação de nova tentativa; não apresentar dados
+  antigos como resultado atual da operação que falhou.
+- `empty`: mensagem de nenhuma cidade encontrada, termo preservado e
+  possibilidade de outra busca. Entrada em branco mostra validação sem
+  chamar o serviço.
+- `success`: opções de cidade sem seleção automática; cidade selecionada,
+  condições atuais e cinco previsões com unidades e formatação corretas.
+- Sucesso parcial: manter valores válidos e cinco datas, sinalizando campos
+  indisponíveis sem estimativas. Sem campos atuais exibíveis e com previsão
+  válida, mostrar falha das condições atuais, preservar a previsão e permitir
+  retry da consulta completa, com uma única chamada e recuperação da seção.
+  Validar nomes acessíveis, anúncio de estados e operação por teclado em todos
+  os estados relevantes.
+
+Restaurar mocks e temporizadores após cada teste para evitar interferência
+entre cenários. Usar relógio fixo quando o resultado depender de data.
+
+### Playwright — fluxos E2E e viewport mobile
+
+Executar os fluxos com a aplicação real e interceptar as chamadas Open-Meteo
+com `page.route`, fornecendo respostas controladas. Não simular hooks ou
+componentes: validar a integração completa entre UI, estado e serviços, sem
+depender da rede externa. Fixar o relógio nos cenários de datas e timeout.
+
+- Buscar, escolher explicitamente uma cidade homônima e visualizar o clima
+  atual e exatamente cinco datas no fuso da cidade.
+- Validar busca em branco sem request, resultado vazio e cidades com detalhes
+  geográficos ausentes; corrigir a entrada e completar uma nova busca.
+- Alternar Celsius/Fahrenheit durante e depois da consulta; conferir valores,
+  arredondamento e rótulos na temperatura atual e nas mínimas/máximas. Contar
+  requests ao endpoint de forecast e confirmar que a alternância não gera
+  nenhum adicional.
+- Simular dados parciais, falha de rede/API e timeout; verificar feedback,
+  retry bem-sucedido e bloqueio de chamadas duplicadas. Incluir condições
+  atuais sem campos exibíveis com previsão válida e recuperar as condições
+  atuais pelo retry da consulta completa.
+- Após falha na busca, editar o campo e acionar retry; confirmar que o request
+  usa o termo original. Durante uma busca pendente, reenviar o mesmo termo
+  por botão e Enter sem requests adicionais; depois enviar um termo diferente
+  e confirmar que uma nova busca substitui a anterior.
+- Entregar resposta obsoleta após uma nova busca ou seleção de cidade;
+  confirmar que apenas a operação vigente determina os dados exibidos.
+- Percorrer busca, seleção, unidade e retry por teclado, verificando nomes
+  acessíveis e feedback de loading, vazio e erro.
+
+Rodar a suíte nos projetos já definidos em
+[`playwright.config.ts`](../playwright.config.ts): `chromium` (Desktop Chrome)
+e `mobile` (iPhone 13, viewport de 390 × 664 CSS px). Em ambos, verificar que
+campo, seleção, unidades, mensagens e cinco previsões permanecem visíveis ou
+alcançáveis por rolagem vertical, sem sobreposição ou corte e sem rolagem
+horizontal. Incluir nomes longos de cidade, mensagens extensas e aumento do
+texto. No projeto mobile, completar o fluxo também com interação por toque.
+A emulação valida o viewport e interações, não substitui teste em aparelho
+físico (**RNF1**, **RNF3**, **RNF6**).
+
+### Execução e critério de conclusão
+
+Na implementação, executar `pnpm lint`, `pnpm build` e `pnpm test`; executar
+`pnpm test:e2e` para os fluxos de navegador nos dois projetos.
+`pnpm test:coverage` ajuda a identificar lacunas, mas percentual isolado não
+substitui os cenários e saídas exigidos acima. Esta atualização documental não
+exige executar essas suítes.
 
 ## Risks & Trade-offs
 
-- **Disponibilidade e limites da Open-Meteo:** falhas externas interrompem
-  consultas. Timeout, mensagens específicas e retry são a mitigação prevista;
-  cache e fallback ficam fora do escopo.
-- **Cidades homônimas:** nome sozinho não identifica localidade. A seleção
-  explícita e a exibição apenas dos detalhes recebidos reduzem a chance de
-  consulta errada (**RF1**).
-- **Fuso e virada de dia:** usar o fuso do navegador poderia deslocar datas.
-  A fonte da verdade é a zona horária retornada pela API; falhar é preferível a
-  presumir datas não interpretáveis (**RF3**, **RNF5**).
-- **Campos ou códigos desconhecidos:** uma tabela local de códigos WMO precisa
-  acompanhar códigos suportados, mas evita descrições inventadas. Dados
-  ausentes ficam indisponíveis (**RF2**, **RF3**).
-- **Conversão local:** evita chamadas adicionais e permite alternar durante a
-  consulta, mas exige uma regra consistente de arredondamento e tratamento de
-  zero negativo (**RF4**).
-- **Respostas tardias:** `AbortController` reduz trabalho desnecessário, mas
-  identificadores de operação são necessários para proteger o estado contra
-  resultados obsoletos (**RF5**, **RNF5**).
-- **Estado apenas em memória:** simplifica a primeira versão e evita persistir
-  preferências sem decisão explícita; unidade e cidade não sobrevivem à sessão.
-- **Sem backend:** reduz infraestrutura e é compatível com APIs públicas sem
-  chave, mas mantém a aplicação dependente da disponibilidade e do
-  comportamento dos serviços externos.
+As alternativas abaixo foram avaliadas para a primeira versão; não são
+funcionalidades adicionais aprovadas.
+
+| Decisão do plano | Benefício e custo/risco | Alternativas consideradas e motivo para não adotar agora |
+| --- | --- | --- |
+| React + Vite client-side, sem backend | Menos infraestrutura e integração direta com API pública sem chave; depende da disponibilidade e das regras de acesso da fonte no navegador. | Backend/proxy ou framework com SSR: permitiria centralizar acesso e cache, mas acrescentaria hospedagem e operação sem requisito correspondente. |
+| Estado local em hook, sem store global ou persistência | Mantém a orquestração próxima da tela e reduz dependências; cidade e unidade se perdem ao recarregar ou encerrar a sessão. | Context/store global e `localStorage`: úteis para múltiplas telas ou preferências persistidas, mas sem necessidade definida no escopo atual. |
+| `fetch` com `AbortController` e identificadores de operação | Evita novo cliente HTTP e impede respostas obsoletas; exige implementar e testar deadline, limpeza e concorrência. | Axios ou biblioteca de server state como TanStack Query: reduziriam parte da infraestrutura, mas introduziriam dependências e políticas de cache/retry desnecessárias agora. Cancelamento isolado não garante proteção contra respostas tardias. |
+| Open-Meteo sem cache, fallback ou retry automático | Fonte única e recuperação explícita, sem apresentar dado antigo como atual; falhas e limites externos interrompem a consulta até nova tentativa. | Cache, provedor alternativo e retry automático: melhorariam disponibilidade, mas exigiriam regras de validade, normalização e carga adicionais fora do escopo. |
+| Celsius como fonte única, Fahrenheit derivado na renderização | Alternância imediata, inclusive durante loading, sem request; requer conversão e arredondamento consistentes. | Consultar a API por unidade aumenta latência e chamadas; guardar duas cópias permite divergência e erro de arredondamento acumulado (**RF4**). |
+| Seleção explícita de cidade | Reduz erro com cidades homônimas, mas acrescenta uma interação. | Escolher automaticamente o primeiro resultado ou usar geolocalização contraria a seleção exigida e o escopo de privacidade (**RF1**, **RNF7**). |
+| Normalização por campo e tabela local WMO em pt-BR | Preserva dados parciais sem inventar valores; exige manter mapeamentos e distinguir ausência de estrutura inválida. | Rejeitar toda resposta parcial descartaria valores úteis; preencher com zero, estimativas ou códigos brutos violaria os requisitos (**RF2**, **RF3**). |
+| Datas calculadas no fuso IANA retornado, com validação estrita | Mantém hoje e os quatro dias seguintes corretos; fuso/datas inválidos impedem exibir a previsão com segurança. | Fuso do navegador é mais simples, mas pode deslocar o dia. Biblioteca de datas só se justifica se `Intl` e funções puras deixarem de atender às regras (**RF3**, **RNF5**). |
+| Funções puras, serviços, hooks e apresentação separados | Permite testes isolados e contratos claros; adiciona limites e arquivos que devem ter uso real. | Concentrar rede e regras nos componentes reduz a estrutura inicial, mas acopla transporte, estado e renderização; camadas genéricas adicionais seriam complexidade sem benefício comprovado. |
+| Vitest amplo e Playwright focado, com rede simulada | Feedback rápido e resultados determinísticos; mocks não detectam sozinhos mudanças no serviço externo e emulação mobile não equivale a aparelho físico. | Apenas E2E aumenta custo e dificulta localizar falhas; apenas unitários não valida integração e layout; API real nas suítes obrigatórias adiciona instabilidade. Verificação manual da fonte e em aparelho complementa, mas não substitui os testes automatizados. |
